@@ -101,15 +101,70 @@ class PicoLink:
         raise RuntimeError("Pico did not respond to PING")
 
 
-def read_x1emu_tap(path: Path) -> tuple[int, bytes]:
+"""
+.TAP file formats:
+
+X1EMU:
+    [4]  rate_hz (LE)
+    [..] raw sample bytes (MSB-first within each byte)
+
+XMillennium T-tune:
+    [0x00, 4]  magic "TAPE" (0x45504154 LE)
+    [0x04,17]  name (ASCIIZ, NUL-padded)
+    [0x15, 5]  reserved (zeros)
+    [0x1A, 1]  protect  (0x10 = write protected)
+    [0x1B, 1]  format   (0x01 = sampling)
+    [0x1C, 4]  frequency (Hz, LE)
+    [0x20, 4]  datasize  (in BITS, LE)
+    [0x24, 4]  position  (in BITS, LE)
+    [0x28,..]  raw sample bytes
+"""
+TTUNE_MAGIC = b"TAPE"
+TTUNE_HEADER_SIZE = 0x28
+
+
+def read_tap(path: Path) -> tuple[int, bytes]:
+    """Read an X1EMU or T-tune .TAP file. Returns (rate_hz, data_bytes)."""
     raw = path.read_bytes()
     if len(raw) < 4:
         raise ValueError(f"{path} is too short to be a .TAP file")
+
+    if raw[:4] == TTUNE_MAGIC:
+        if len(raw) < TTUNE_HEADER_SIZE:
+            raise ValueError(f"{path}: truncated T-tune header")
+        fmt = raw[0x1B]
+        if fmt != 0x01:
+            raise ValueError(f"{path}: unsupported T-tune format byte 0x{fmt:02x}")
+        rate  = struct.unpack("<I", raw[0x1C:0x20])[0]
+        nbits = struct.unpack("<I", raw[0x20:0x24])[0]
+        nbytes = (nbits + 7) // 8
+        if not (1000 <= rate <= 200000):
+            raise ValueError(f"{path}: invalid T-tune frequency {rate} Hz")
+        end = TTUNE_HEADER_SIZE + nbytes
+        if end > len(raw):
+            raise ValueError(f"{path}: T-tune datasize {nbits} bits exceeds file")
+        return rate, raw[TTUNE_HEADER_SIZE:end]
+
     rate = struct.unpack("<I", raw[:4])[0]
     if not (1000 <= rate <= 200000):
-        raise ValueError(f"{path}: invalid sampling rate {rate} Hz "
-                         f"(only X1EMU format is supported here)")
+        raise ValueError(f"{path}: not X1EMU or T-tune (first 4 bytes don't decode)")
     return rate, raw[4:]
+
+
+def write_ttune_header(f, rate: int, name: str, protect: bool,
+                       data_bits: int = 0, position_bits: int = 0) -> None:
+    """Write a 40-byte T-tune header. Caller can patch datasize/position
+    later by seeking to offset 0x20 / 0x24."""
+    name_b = name.encode("ascii", errors="replace")[:17]
+    name_b = name_b + b"\x00" * (17 - len(name_b))
+    f.write(TTUNE_MAGIC)                                 # 0x00
+    f.write(name_b)                                      # 0x04
+    f.write(b"\x00" * 5)                                 # 0x15 reserve
+    f.write(bytes([0x10 if protect else 0x00]))          # 0x1A protect
+    f.write(bytes([0x01]))                               # 0x1B format
+    f.write(struct.pack("<I", rate))                     # 0x1C frequency
+    f.write(struct.pack("<I", data_bits))                # 0x20 datasize (bits)
+    f.write(struct.pack("<I", position_bits))            # 0x24 position (bits)
 
 
 def cmd_read(link: PicoLink, args: argparse.Namespace) -> int:
@@ -143,7 +198,12 @@ def cmd_read(link: PicoLink, args: argparse.Namespace) -> int:
     total = 0
     stats_line = None
     with out.open("wb") as f:
-        f.write(struct.pack("<I", args.rate))
+        if args.format == "ttune":
+            # datasize/position get patched after the trim step
+            write_ttune_header(f, args.rate, args.name, args.protect)
+        else:
+            f.write(struct.pack("<I", args.rate))
+        header_size = TTUNE_HEADER_SIZE if args.format == "ttune" else 4
         while True:
             try:
                 line = link.read_line()
@@ -185,10 +245,18 @@ def cmd_read(link: PicoLink, args: argparse.Namespace) -> int:
             trim_bytes = min(trim_bytes, total)
             if trim_bytes > 0:
                 with out.open("r+b") as f:
-                    f.truncate(4 + total - trim_bytes)
+                    f.truncate(header_size + total - trim_bytes)
                 trimmed = trim_bytes
                 print(f"trimmed {trimmed} bytes of trailing silence "
                       f"(kept {args.keep}s padding)")
+
+    # Patch the T-tune header's datasize field now that we know the
+    # final byte count (post-trim).
+    if args.format == "ttune":
+        final_bytes = total - trimmed
+        with out.open("r+b") as f:
+            f.seek(0x20)
+            f.write(struct.pack("<I", final_bytes * 8))
 
     # Mirror the original: send STOP after sampling completes.
     link.send_line("CMD 01")
@@ -201,7 +269,7 @@ def cmd_read(link: PicoLink, args: argparse.Namespace) -> int:
 
 
 def cmd_write(link: PicoLink, args: argparse.Namespace) -> int:
-    rate, data = read_x1emu_tap(Path(args.input))
+    rate, data = read_tap(Path(args.input))
     if args.rate is not None:
         rate = args.rate
     print(f"sending {len(data)} bytes at {rate} Hz")
@@ -331,6 +399,12 @@ def main() -> int:
     pr.add_argument("--idle", type=int, default=15, help="idle-stop seconds")
     pr.add_argument("--keep", type=int, default=3,
                     help="seconds of trailing silence to keep after idle-stop")
+    pr.add_argument("--format", choices=["x1emu", "ttune"], default="ttune",
+                    help="output .TAP variant (default ttune)")
+    pr.add_argument("--name", default="x8rl1-pico",
+                    help="tape name embedded in T-tune header (max 16 chars)")
+    pr.add_argument("--protect", action="store_true",
+                    help="set the write-protect flag in T-tune header")
     pr.add_argument("--force", action="store_true")
     pr.set_defaults(func=cmd_read)
 
