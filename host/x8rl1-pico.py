@@ -8,11 +8,11 @@ Sends text commands and reads back framed binary data, writing it
 to X1EMU-format .TAP files.
 
 Examples:
-    receiver.py --port /dev/cu.usbmodem1234 read tape.tap
-    receiver.py --port /dev/cu.usbmodem1234 read --rate 16000 --max 30 tape.tap
-    receiver.py --port /dev/cu.usbmodem1234 write tape.tap
-    receiver.py --port /dev/cu.usbmodem1234 cmd 02       # PLAY
-    receiver.py --port /dev/cu.usbmodem1234 status
+    x8rl1-pico.py --port /dev/cu.usbmodem1234 read tape.tap
+    x8rl1-pico.py --port /dev/cu.usbmodem1234 read --rate 16000 --max 30 tape.tap
+    x8rl1-pico.py --port /dev/cu.usbmodem1234 write tape.tap
+    x8rl1-pico.py --port /dev/cu.usbmodem1234 cmd 02       # PLAY
+    x8rl1-pico.py --port /dev/cu.usbmodem1234 status
 """
 
 from __future__ import annotations

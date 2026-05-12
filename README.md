@@ -42,10 +42,10 @@ the Pico, then drop the `.uf2` onto the mounted RPI-RP2 volume.
 
 ```sh
 pip install pyserial
-python host/receiver.py --port /dev/cu.usbmodem1234 status
-python host/receiver.py --port /dev/cu.usbmodem1234 read tape.tap
-python host/receiver.py --port /dev/cu.usbmodem1234 write tape.tap
-python host/receiver.py --port /dev/cu.usbmodem1234 cmd 02   # PLAY
+python host/x8rl1-pico.py --port /dev/cu.usbmodem1234 status
+python host/x8rl1-pico.py --port /dev/cu.usbmodem1234 read tape.tap
+python host/x8rl1-pico.py --port /dev/cu.usbmodem1234 write tape.tap
+python host/x8rl1-pico.py --port /dev/cu.usbmodem1234 cmd 02   # PLAY
 ```
 
 ## Limitations vs. the original
