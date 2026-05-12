@@ -8,17 +8,17 @@ PC over USB CDC. The host writes `.TAP` image files.
 
 ## Wiring
 
-CZ-8RL1 DIN-7  →  Pico GPIO
+CZ-8RL1 DIN-7  →  Pico GPIO (truth is `src/pins.h`)
 
-| DIN-7 | Signal       | Pico GPIO | Direction       |
-|-------|--------------|-----------|-----------------|
-| 1     | WRITE_DATA   | GPIO 17   | Pico → CZ-8RL1  |
-| 2     | STROBE       | GPIO 22   | Pico → CZ-8RL1  |
-| 3     | BUSY         | GPIO 23   | CZ-8RL1 → Pico  |
-| 4     | READ_DATA    | GPIO 25   | CZ-8RL1 → Pico  |
-| 5     | STATUS_DATA  | GPIO 24   | CZ-8RL1 → Pico  |
-| 6     | GND          | GND       | —               |
-| 7     | COMMAND_DATA | GPIO 27   | Pico → CZ-8RL1  |
+| DIN-7 | Signal       | Pico GPIO | Header pin | Direction       |
+|-------|--------------|-----------|------------|-----------------|
+| 1     | WRITE_DATA   | GPIO 9    | pin 12     | Pico → CZ-8RL1  |
+| 2     | STROBE       | GPIO 10   | pin 14     | Pico → CZ-8RL1  |
+| 3     | BUSY         | GPIO 8    | pin 11     | CZ-8RL1 → Pico  |
+| 4     | READ_DATA    | GPIO 6    | pin 9      | CZ-8RL1 → Pico  |
+| 5     | STATUS_DATA  | GPIO 7    | pin 10     | CZ-8RL1 → Pico  |
+| 6     | GND          | GND       | pin 3/8/…  | —               |
+| 7     | COMMAND_DATA | GPIO 11   | pin 15     | Pico → CZ-8RL1  |
 
 The Pico's internal pull-ups are enabled on the three input pins. The
 CZ-8RL1's outputs appear to be open-collector, so the line is naturally

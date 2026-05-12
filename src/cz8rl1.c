@@ -87,9 +87,13 @@ static bool wait_pin(uint pin, bool want, uint32_t min_us, uint32_t max_us) {
 
 static bool is_apss(void) {
     timing_preset_basetime();
-    /* APSS: BUSY low and STATUS stays high for >2 * TICK_HEAD */
-    if (pin_read(PIN_BUSY) == false && pin_read(PIN_STATUS) == true) {
-        return !wait_pin(PIN_STATUS, false, 0, TICK_HEAD * 2);
+    /* APSS: BUSY stays HIGH and STATUS stays LOW for >2 * TICK_HEAD.
+       This matches the original X8RL1/cz8rl1.c polarity (where the
+       APSS condition is `BUSY=1 AND STATUS=0` in the LPT status
+       register, with no XOR mask). Normal idle on this device is
+       BUSY=0/STATUS=1, which would have falsely triggered APSS. */
+    if (pin_read(PIN_BUSY) == true && pin_read(PIN_STATUS) == false) {
+        return !wait_pin(PIN_STATUS, true, 0, TICK_HEAD * 2);
     }
     return false;
 }
@@ -128,42 +132,57 @@ static int cz8rl1_rx(void) {
         return CZ8RL1_STS_DOAPSS;
     }
 
-    /* wait for STATUS to go high (start of header), within 2s */
-    if (!wait_pin(PIN_STATUS, true, 0, 2000000)) {
+    /* STATUS idles HIGH on this device. Header = device pulls STATUS
+       LOW for ~1000us, then releases. Bits = LOW for 750us (=1) or
+       250us (=0), with a HIGH gap between. This matches the original
+       LPT-port code's polarity (check_low for assertion, check_high
+       for release). */
+
+    /* wait for STATUS to go low (start of header), within 2s */
+    if (!wait_pin(PIN_STATUS, false, 0, 2000000)) {
         set_idle();
         return CZ8RL1_ERR_NOHEADER;
     }
-    /* header: STATUS high for ~1000us +- 25% */
-    if (!wait_pin(PIN_STATUS, false,
+    /* header: STATUS low for ~1000us +- 25%, then back to high */
+    if (!wait_pin(PIN_STATUS, true,
                   (uint32_t)(TICK_HEAD * 0.75),
                   (uint32_t)(TICK_HEAD * 1.25))) {
         set_idle();
         return CZ8RL1_ERR_BADHEAD;
     }
 
-    /* read 8 bits, MSB first */
+    /* Read 8 bits, MSB first.
+
+       The bit value is encoded in the HIGH-space duration between
+       consecutive LOW pulses (the original tx defines bit=1 as a
+       750us space and bit=0 as a 250us space, then a fixed 250us
+       LOW "make"). Measure the space width directly. */
     for (int bitmask = 0x80; bitmask; bitmask >>= 1) {
-        /* wait for STATUS high (start of bit) */
+        /* measure SPACE: how long STATUS stays HIGH before the next
+           falling edge */
         timing_preset_basetime();
-        while (!pin_read(PIN_STATUS)) {
-            if (timing_progress_us() > 2000) {
-                set_idle();
-                return CZ8RL1_ERR_BADBIT;
-            }
-        }
-        /* measure how long STATUS stays high */
-        timing_preset_basetime();
-        uint64_t width;
+        uint64_t space_us;
         do {
-            width = timing_progress_us();
-            if (width > 2000) {
+            space_us = timing_progress_us();
+            if (space_us > 2000) {
                 set_idle();
                 return CZ8RL1_ERR_BADBIT;
             }
         } while (pin_read(PIN_STATUS));
-        /* wait same width on the LOW side, then sample */
-        timing_wait_us((uint32_t)width);
-        if (width > 750) {
+
+        /* wait through the MAKE (LOW) pulse */
+        timing_preset_basetime();
+        uint64_t make_us;
+        do {
+            make_us = timing_progress_us();
+            if (make_us > 2000) {
+                set_idle();
+                return CZ8RL1_ERR_BADBIT;
+            }
+        } while (!pin_read(PIN_STATUS));
+
+        /* threshold midway between 250us (bit=0) and 750us (bit=1) */
+        if (space_us > 500) {
             value |= bitmask;
         }
     }
@@ -212,6 +231,69 @@ int cz8rl1_send_command(uint8_t command) {
     /* small inter-command pause */
     sleep_us(1000);
     return status;
+}
+
+static inline uint8_t sample_inputs(void) {
+    uint32_t gpio = sio_hw->gpio_in;
+    uint8_t s = 0;
+    if (gpio & (1u << PIN_BUSY))      s |= 0x01;
+    if (gpio & (1u << PIN_STATUS))    s |= 0x02;
+    if (gpio & (1u << PIN_READ_DATA)) s |= 0x04;
+    return s;
+}
+
+uint32_t cz8rl1_trace_command(uint8_t command,
+                              uint32_t trace_duration_us,
+                              cz8rl1_trace_event_t *events,
+                              uint32_t max_events,
+                              uint8_t *initial_state_out) {
+    uint32_t saved = save_and_disable_interrupts();
+
+    uint8_t initial = sample_inputs();
+    if (initial_state_out) *initial_state_out = initial;
+
+    uint64_t tx_start_us = time_us_64();
+    cz8rl1_tx(command);
+
+    uint32_t n = 0;
+    uint8_t  prev = initial;
+    uint64_t deadline = tx_start_us + trace_duration_us;
+
+    /* Replicate the full rx handshake so the device actually transmits
+       its response on STATUS: catch the BUSY-rise (ack), wait 1ms,
+       assert STROBE. Then keep sampling so STATUS pulses are recorded. */
+    bool busy_rise_seen = false;
+    bool strobe_asserted = false;
+    uint64_t busy_rise_us = 0;
+
+    while (time_us_64() < deadline) {
+        uint8_t cur = sample_inputs();
+        uint64_t now = time_us_64();
+
+        if (cur != prev) {
+            if (n < max_events) {
+                events[n].t_us     = (uint32_t)(now - tx_start_us);
+                events[n].pin_state = cur;
+                n++;
+            }
+            if (!busy_rise_seen && (cur & 0x01) && !(prev & 0x01)) {
+                busy_rise_seen = true;
+                busy_rise_us = now;
+            }
+            prev = cur;
+        }
+
+        if (busy_rise_seen && !strobe_asserted &&
+                (now - busy_rise_us) >= 1000) {
+            pin_high(PIN_STROBE);
+            strobe_asserted = true;
+        }
+    }
+
+    pin_low(PIN_STROBE);
+    set_idle();
+    restore_interrupts(saved);
+    return n;
 }
 
 int cz8rl1_write_data(const uint8_t *buf,

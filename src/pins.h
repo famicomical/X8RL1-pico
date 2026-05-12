@@ -14,13 +14,13 @@
       7. COMMAND_DATA (Pico output)
 */
 
-#define PIN_WRITE_DATA   17
-#define PIN_STROBE       22
-#define PIN_COMMAND      27
+#define PIN_WRITE_DATA    9
+#define PIN_STROBE       10
+#define PIN_COMMAND      11
 
-#define PIN_BUSY         23
-#define PIN_READ_DATA    25
-#define PIN_STATUS       24
+#define PIN_BUSY          8
+#define PIN_READ_DATA     6
+#define PIN_STATUS        7
 
 #define PIN_OUTPUT_MASK  ((1u << PIN_WRITE_DATA) | (1u << PIN_STROBE) | (1u << PIN_COMMAND))
 #define PIN_INPUT_MASK   ((1u << PIN_BUSY) | (1u << PIN_READ_DATA) | (1u << PIN_STATUS))

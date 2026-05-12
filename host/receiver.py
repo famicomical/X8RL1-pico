@@ -15,13 +15,17 @@ Examples:
     receiver.py --port /dev/cu.usbmodem1234 status
 """
 
+from __future__ import annotations
+
 import argparse
+import re
 import struct
 import sys
 import time
 from pathlib import Path
 
 import serial
+from serial.tools import list_ports
 
 
 CZ8RL1_CMD_NAMES = {
@@ -29,6 +33,26 @@ CZ8RL1_CMD_NAMES = {
     0x04: "REW",   0x05: "AFF",   0x06: "AREW",  0x0A: "REC",
     0x80: "STATUS", 0x81: "SENSOR",
 }
+
+# Mirrors CZ8RL1_STS_AUTOSTOP in src/cz8rl1.h (0x101).
+CZ8RL1_STS_AUTOSTOP = 0x101
+
+# Raspberry Pi VID, plus the PID assigned to pico_stdlib's stdio_usb CDC.
+PICO_VID = 0x2E8A
+PICO_STDIO_PID = 0x000A
+
+
+def find_pico_port() -> str | None:
+    """Return the /dev path of a Pico running stdio_usb, or None."""
+    matches = [p for p in list_ports.comports()
+               if p.vid == PICO_VID and p.pid == PICO_STDIO_PID]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        names = ", ".join(p.device for p in matches)
+        print(f"warning: found {len(matches)} Pico devices ({names}); "
+              f"using {matches[0].device}", file=sys.stderr)
+    return matches[0].device
 
 
 class PicoLink:
@@ -59,16 +83,21 @@ class PicoLink:
             remaining -= len(chunk)
         return b"".join(chunks)
 
-    def wait_for_ready(self, attempts: int = 20) -> None:
-        # Send a PING and look for PONG; some hosts buffer the boot READY.
+    def wait_for_ready(self, attempts: int = 20) -> str:
+        """PING the device, return the identifying PONG line."""
         for _ in range(attempts):
             self.send_line("PING")
             try:
                 line = self.read_line()
             except TimeoutError:
                 continue
-            if line.endswith("PONG") or line == "PONG":
-                return
+            if line.startswith("PONG"):
+                # Earlier retries may have queued extra PINGs that the
+                # Pico is still echoing back; drain them so the next
+                # read_line() returns the real command response.
+                time.sleep(0.1)
+                self.ser.reset_input_buffer()
+                return line
         raise RuntimeError("Pico did not respond to PING")
 
 
@@ -89,9 +118,20 @@ def cmd_read(link: PicoLink, args: argparse.Namespace) -> int:
         print(f"refusing to overwrite {out} (use --force)", file=sys.stderr)
         return 1
 
-    print(f"sampling at {args.rate} Hz, max {args.max}s, "
-          f"idle-stop {args.idle}s ...")
-    link.send_line(f"READ {args.rate} {args.max} {args.idle}")
+    max_sec = args.max * 60
+    print(f"sampling at {args.rate} Hz, max {args.max} min, "
+          f"idle-stop {args.idle}s, keep {args.keep}s, jitter 50/50%")
+
+    # Match the original cmt_read_tape: send PLAY, give the transport
+    # 200 ms to settle, then start sampling.
+    link.send_line("CMD 02")
+    resp = link.read_line()
+    if not resp.startswith("STS"):
+        print(f"PLAY failed: {resp}", file=sys.stderr)
+        return 1
+    time.sleep(0.2)
+
+    link.send_line(f"READ {args.rate} {max_sec} {args.idle}")
 
     line = link.read_line()
     if not line.startswith("OK"):
@@ -134,7 +174,29 @@ def cmd_read(link: PicoLink, args: argparse.Namespace) -> int:
     if end != "END":
         print(f"warning: expected END, got {end!r}", file=sys.stderr)
 
-    print(f"saved {total} bytes to {out}")
+    # If the run terminated via idle-detect, trim the trailing silence
+    # so the .TAP file only retains `--keep` seconds of padding. Matches
+    # the original X8RL1 behaviour (cmt_read_tape post-processing).
+    trimmed = 0
+    if stats_line and args.idle > args.keep:
+        m = re.search(r"result=(-?\d+)", stats_line)
+        if m and int(m.group(1)) == CZ8RL1_STS_AUTOSTOP:
+            trim_bytes = (args.idle - args.keep) * args.rate // 8
+            trim_bytes = min(trim_bytes, total)
+            if trim_bytes > 0:
+                with out.open("r+b") as f:
+                    f.truncate(4 + total - trim_bytes)
+                trimmed = trim_bytes
+                print(f"trimmed {trimmed} bytes of trailing silence "
+                      f"(kept {args.keep}s padding)")
+
+    # Mirror the original: send STOP after sampling completes.
+    link.send_line("CMD 01")
+    resp = link.read_line()
+    if not resp.startswith("STS"):
+        print(f"warning: STOP response: {resp}", file=sys.stderr)
+
+    print(f"saved {total - trimmed} bytes to {out}")
     return 0
 
 
@@ -179,10 +241,85 @@ def cmd_status(link: PicoLink, _args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_pins(link: PicoLink, args: argparse.Namespace) -> int:
+    link.send_line(f"PINS {args.duration}")
+    print(link.read_line())
+    return 0
+
+
+def cmd_level(link: PicoLink, _args: argparse.Namespace) -> int:
+    link.send_line("LEVEL")
+    print(link.read_line())
+    return 0
+
+
+def cmd_poke(link: PicoLink, args: argparse.Namespace) -> int:
+    link.send_line(f"POKE {args.pin} {args.level}")
+    print(link.read_line())
+    return 0
+
+
+def cmd_raw(link: PicoLink, args: argparse.Namespace) -> int:
+    link.send_line(args.line)
+    print(link.read_line())
+    return 0
+
+
+def _format_pin_state(s: int) -> str:
+    return f"BUSY={s & 1} STATUS={(s >> 1) & 1} RDATA={(s >> 2) & 1}"
+
+
+def cmd_trace(link: PicoLink, args: argparse.Namespace) -> int:
+    code = int(args.code, 16)
+    name = CZ8RL1_CMD_NAMES.get(code, "?")
+    print(f"tracing command {code:#04x} ({name}) for {args.duration} us")
+    link.send_line(f"TRACE {code:02x} {args.duration}")
+
+    header = link.read_line()
+    if not header.startswith("TRACE "):
+        print(f"unexpected: {header!r}", file=sys.stderr)
+        return 1
+    print(header)
+    fields = dict(kv.split("=", 1) for kv in header.split()[1:])
+    initial = int(fields.get("init", "0"))
+    print(f"  initial: {_format_pin_state(initial)}")
+
+    prev_state = initial
+    while True:
+        line = link.read_line()
+        if line == "TRACE_END":
+            break
+        if not line.startswith("EVT "):
+            print(f"unexpected: {line!r}", file=sys.stderr)
+            continue
+        _, t_us, state_s = line.split()
+        state = int(state_s)
+        changed = []
+        for bit, label in ((0, "BUSY"), (1, "STATUS"), (2, "RDATA")):
+            old = (prev_state >> bit) & 1
+            new = (state >> bit) & 1
+            if old != new:
+                changed.append(f"{label}:{old}->{new}")
+        print(f"  t={int(t_us):>8} us  {_format_pin_state(state)}  ({', '.join(changed)})")
+        prev_state = state
+    return 0
+
+
+def cmd_ping(link: PicoLink, _args: argparse.Namespace) -> int:
+    link.send_line("PING")
+    line = link.read_line()
+    print(line)
+    if "x8rl1-pico" in line:
+        return 0
+    print("warning: device did not identify as x8rl1-pico", file=sys.stderr)
+    return 1
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--port", required=True, help="serial device for the Pico")
+    p.add_argument("--port", help="serial device for the Pico "
+                                  "(auto-detected by USB VID:PID if omitted)")
     p.add_argument("--baud", type=int, default=115200)
 
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -190,8 +327,10 @@ def main() -> int:
     pr = sub.add_parser("read", help="record tape into a .TAP file")
     pr.add_argument("output")
     pr.add_argument("--rate", type=int, default=8000)
-    pr.add_argument("--max",  type=int, default=60, help="max seconds")
+    pr.add_argument("--max",  type=int, default=60, help="max recording time (minutes)")
     pr.add_argument("--idle", type=int, default=15, help="idle-stop seconds")
+    pr.add_argument("--keep", type=int, default=3,
+                    help="seconds of trailing silence to keep after idle-stop")
     pr.add_argument("--force", action="store_true")
     pr.set_defaults(func=cmd_read)
 
@@ -208,9 +347,46 @@ def main() -> int:
     ps = sub.add_parser("status", help="query device status + sensor")
     ps.set_defaults(func=cmd_status)
 
+    pp = sub.add_parser("ping", help="check that the device is x8rl1-pico")
+    pp.set_defaults(func=cmd_ping)
+
+    ppins = sub.add_parser("pins", help="sample input pins for N ms and report HIGH counts")
+    ppins.add_argument("--duration", type=int, default=10,
+                       help="sample window in ms (1..1000, default 10)")
+    ppins.set_defaults(func=cmd_pins)
+
+    plvl = sub.add_parser("level", help="instantaneous read of all input pins")
+    plvl.set_defaults(func=cmd_level)
+
+    ppoke = sub.add_parser("poke", help="drive an output pin to a level (for multimeter probing)")
+    ppoke.add_argument("pin", choices=["wdata", "strobe", "cmd"])
+    ppoke.add_argument("level", type=int, choices=[0, 1])
+    ppoke.set_defaults(func=cmd_poke)
+
+    praw = sub.add_parser("raw", help="send a raw line to the Pico and print the reply")
+    praw.add_argument("line", help="exact text to send (e.g. \"CMD 80\")")
+    praw.set_defaults(func=cmd_raw)
+
+    ptrace = sub.add_parser("trace",
+        help="send a CZ8RL1 command and capture every BUSY/STATUS/RDATA edge in firmware")
+    ptrace.add_argument("code", help="command byte in hex (e.g. 80 = STATUS, 01 = STOP)")
+    ptrace.add_argument("--duration", type=int, default=100000,
+                        help="trace window in microseconds (1000..2000000, default 100000)")
+    ptrace.set_defaults(func=cmd_trace)
+
     args = p.parse_args()
+    if args.port is None:
+        args.port = find_pico_port()
+        if args.port is None:
+            print("could not auto-detect a Pico on USB; pass --port",
+                  file=sys.stderr)
+            return 1
+        print(f"using auto-detected Pico at {args.port}")
     link = PicoLink(args.port, args.baud)
-    link.wait_for_ready()
+    pong = link.wait_for_ready()
+    if "x8rl1-pico" not in pong:
+        print(f"warning: device at {args.port} did not identify as x8rl1-pico "
+              f"(got {pong!r})", file=sys.stderr)
     return args.func(link, args)
 
 

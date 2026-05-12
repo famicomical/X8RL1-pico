@@ -28,11 +28,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include "pico/stdlib.h"
+#include "hardware/gpio.h"
 
 #include "cz8rl1.h"
 #include "sampler.h"
 #include "usb_stream.h"
 #include "pins.h"
+
+#define X8RL1_PICO_VERSION "0.1"
 
 /*
     READ uses sampler.c — a hardware timer + GPIO IRQ keep sampling
@@ -53,24 +56,32 @@ static void send_err(const char *code, const char *msg) {
     usb_stream_printf("ERR %s %s", code, msg);
 }
 
+/* Render `status` as "STS <hex>". Values in 0..255 are the device's raw
+   reply byte (printed two digits). Values >=0x100 are internal status
+   codes from cz8rl1.h (CZ8RL1_STS_*); print them at full width so the
+   host can tell e.g. CZ8RL1_STS_DOAPSS (0x104) apart from the raw byte
+   0x04. */
+static void send_status(int status) {
+    if (status < 0) {
+        usb_stream_printf("ERR PROTO %d", status);
+    } else if (status > 0xff) {
+        usb_stream_printf("STS %x", status);
+    } else {
+        usb_stream_printf("STS %02x", status);
+    }
+}
+
 static void handle_cmd(const char *args) {
     unsigned hex;
     if (sscanf(args, "%x", &hex) != 1) {
         send_err("PARSE", "expected hex code");
         return;
     }
-    int status = cz8rl1_send_command((uint8_t)hex);
-    if (status < 0) {
-        usb_stream_printf("ERR PROTO %d", status);
-    } else {
-        usb_stream_printf("STS %02x", status & 0xff);
-    }
+    send_status(cz8rl1_send_command((uint8_t)hex));
 }
 
-static void handle_status(void)  { usb_stream_printf("STS %02x",
-                                       cz8rl1_send_command(CZ8RL1_STATUS) & 0xff); }
-static void handle_sensor(void)  { usb_stream_printf("STS %02x",
-                                       cz8rl1_send_command(CZ8RL1_SENSOR) & 0xff); }
+static void handle_status(void) { send_status(cz8rl1_send_command(CZ8RL1_STATUS)); }
+static void handle_sensor(void) { send_status(cz8rl1_send_command(CZ8RL1_SENSOR)); }
 
 static void drain_to_usb(uint64_t *bytes_sent, uint64_t max_bytes) {
     for (;;) {
@@ -159,6 +170,114 @@ static void handle_write(const char *args) {
     usb_stream_write_line("END");
 }
 
+/*
+    Diagnostic: sample the three input pins for `duration_ms` milliseconds
+    in a tight loop, report instantaneous level + how many samples were
+    HIGH for each. If `high_count` is near 0 or near `total`, the line is
+    stuck; intermediate values mean it's toggling (real protocol activity
+    or noise).
+*/
+static void handle_pins(const char *args) {
+    unsigned duration_ms = 10;
+    if (*args) sscanf(args, "%u", &duration_ms);
+    if (duration_ms < 1) duration_ms = 1;
+    if (duration_ms > 1000) duration_ms = 1000;
+
+    uint32_t busy_hi = 0, status_hi = 0, rdata_hi = 0, total = 0;
+    absolute_time_t end = make_timeout_time_ms(duration_ms);
+    while (!time_reached(end)) {
+        if (gpio_get(PIN_BUSY))      busy_hi++;
+        if (gpio_get(PIN_STATUS))    status_hi++;
+        if (gpio_get(PIN_READ_DATA)) rdata_hi++;
+        total++;
+    }
+
+    /* Also report the current output drive levels so you can confirm
+       the firmware is leaving outputs in the idle state we expect. */
+    bool wr  = gpio_get_out_level(PIN_WRITE_DATA);
+    bool stb = gpio_get_out_level(PIN_STROBE);
+    bool cmd = gpio_get_out_level(PIN_COMMAND);
+
+    usb_stream_printf(
+        "PINS busy=%u/%u status=%u/%u rdata=%u/%u "
+        "out: wdata=%d strobe=%d cmd=%d (samples=%u, dur=%ums)",
+        busy_hi, total, status_hi, total, rdata_hi, total,
+        wr ? 1 : 0, stb ? 1 : 0, cmd ? 1 : 0,
+        total, duration_ms);
+}
+
+/*
+    Diagnostic: instantaneous one-shot read of the three input pins.
+*/
+static void handle_level(void) {
+    usb_stream_printf("LEVEL busy=%d status=%d rdata=%d",
+                      gpio_get(PIN_BUSY) ? 1 : 0,
+                      gpio_get(PIN_STATUS) ? 1 : 0,
+                      gpio_get(PIN_READ_DATA) ? 1 : 0);
+}
+
+/*
+    Diagnostic: drive a single output pin to a given level so it can be
+    probed with a multimeter. Syntax: POKE <wdata|strobe|cmd> <0|1>
+    Does NOT call set_idle() afterwards; the pin stays at the chosen
+    level until another POKE or until cz8rl1_init runs again.
+*/
+static void handle_poke(const char *args) {
+    char name[16] = {0};
+    unsigned level = 0;
+    if (sscanf(args, "%15s %u", name, &level) != 2) {
+        send_err("PARSE", "expected: POKE <wdata|strobe|cmd> <0|1>");
+        return;
+    }
+    uint pin;
+    if      (strcmp(name, "wdata")  == 0) pin = PIN_WRITE_DATA;
+    else if (strcmp(name, "strobe") == 0) pin = PIN_STROBE;
+    else if (strcmp(name, "cmd")    == 0) pin = PIN_COMMAND;
+    else { send_err("PIN", "unknown pin name"); return; }
+
+    gpio_put(pin, level ? 1 : 0);
+    usb_stream_printf("POKE %s=%u (gpio %u)", name, level ? 1 : 0, pin);
+}
+
+/*
+    Diagnostic: send a command byte, then capture every transition on
+    BUSY/STATUS/READ_DATA for the given duration (microseconds). Reports
+    initial state and every observed edge with timestamps relative to
+    the start of tx. One line, suitable for parsing on the host.
+*/
+#define TRACE_MAX_EVENTS 512
+static cz8rl1_trace_event_t trace_events[TRACE_MAX_EVENTS];
+
+static void handle_trace(const char *args) {
+    unsigned hex;
+    unsigned duration_us = 100000;  /* 100 ms default */
+    int n = sscanf(args, "%x %u", &hex, &duration_us);
+    if (n < 1) {
+        send_err("PARSE", "expected: TRACE <hex_cmd> [duration_us]");
+        return;
+    }
+    if (duration_us < 1000)     duration_us = 1000;
+    if (duration_us > 2000000)  duration_us = 2000000;
+
+    uint8_t initial = 0;
+    uint32_t count = cz8rl1_trace_command((uint8_t)hex, duration_us,
+                                          trace_events, TRACE_MAX_EVENTS,
+                                          &initial);
+
+    /* Header line: initial state + count + duration. */
+    usb_stream_printf("TRACE cmd=%02x init=%u dur=%u count=%u",
+                      hex, initial, duration_us, count);
+
+    /* One line per event: "EVT <t_us> <pin_state>" — keeps lines short
+       and easy to parse. pin_state bit 0=BUSY, 1=STATUS, 2=READ_DATA. */
+    for (uint32_t i = 0; i < count; i++) {
+        usb_stream_printf("EVT %u %u",
+                          trace_events[i].t_us,
+                          trace_events[i].pin_state);
+    }
+    usb_stream_write_line("TRACE_END");
+}
+
 static void dispatch(char *line) {
     /* split command from args */
     char *args = strchr(line, ' ');
@@ -169,12 +288,18 @@ static void dispatch(char *line) {
         args = "";
     }
 
-    if      (strcmp(line, "PING")   == 0) usb_stream_write_line("PONG");
+    if      (strcmp(line, "PING")   == 0) usb_stream_printf(
+                                              "PONG x8rl1-pico %s",
+                                              X8RL1_PICO_VERSION);
     else if (strcmp(line, "CMD")    == 0) handle_cmd(args);
     else if (strcmp(line, "STATUS") == 0) handle_status();
     else if (strcmp(line, "SENSOR") == 0) handle_sensor();
     else if (strcmp(line, "READ")   == 0) handle_read(args);
     else if (strcmp(line, "WRITE")  == 0) handle_write(args);
+    else if (strcmp(line, "PINS")   == 0) handle_pins(args);
+    else if (strcmp(line, "LEVEL")  == 0) handle_level();
+    else if (strcmp(line, "POKE")   == 0) handle_poke(args);
+    else if (strcmp(line, "TRACE")  == 0) handle_trace(args);
     else                                  send_err("UNKNOWN", line);
 }
 

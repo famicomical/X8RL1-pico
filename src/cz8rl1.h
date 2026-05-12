@@ -49,4 +49,27 @@ int cz8rl1_write_data(const uint8_t *buf,
                       uint32_t sample_rate,
                       bool busy_break);
 
+/*
+    Diagnostic: send `command` via cz8rl1_tx, then poll the three input
+    pins in a tight loop with interrupts disabled, recording every
+    transition (timestamp relative to the moment tx finished). Returns
+    the number of events captured. Each event's pin_state is a bitmask:
+        bit 0 : BUSY
+        bit 1 : STATUS
+        bit 2 : READ_DATA
+    `initial_state_out` is set to the bitmask sampled immediately before
+    tx, so the host can interpret the first event as a transition from
+    that initial state.
+*/
+typedef struct {
+    uint32_t t_us;
+    uint8_t  pin_state;
+} cz8rl1_trace_event_t;
+
+uint32_t cz8rl1_trace_command(uint8_t command,
+                              uint32_t trace_duration_us,
+                              cz8rl1_trace_event_t *events,
+                              uint32_t max_events,
+                              uint8_t *initial_state_out);
+
 #endif
