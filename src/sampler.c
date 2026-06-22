@@ -27,10 +27,21 @@ static volatile uint32_t  ring_tail;     /* writer: main loop        */
 
 /* Constants for the run, set in sampler_start, read in ISRs. */
 static uint64_t step_us;
+static uint32_t step_den;          /* = sample_rate (Hz), divisor for dither */
 static uint64_t jit_us[2];
 static bool     jit_flag[2];
 static uint32_t idle_limit;
 static bool     busy_break_enabled;
+
+/*
+    Ideal sample grid. cur_target_us is the absolute time the *next*
+    alarm is scheduled for; we advance it arithmetically (never from a
+    measured "now") so ISR-entry latency cannot accumulate, and we carry
+    the sub-microsecond remainder in step_frac so the truncation in
+    step_us cannot accumulate either. Edge corrections re-anchor both.
+*/
+static volatile uint64_t cur_target_us;
+static volatile uint32_t step_frac;
 
 /* Per-run state. ISRs run at the same NVIC priority and therefore
    serialise; reads/writes of these fields don't need locks. */
@@ -71,9 +82,13 @@ static void gpio_callback(uint gpio, uint32_t events) {
             (step - jit_us) past this edge — i.e., jit_us into the
             next bit cell. Identical effect to the DOS code's
             tickbase += ticknow - tick_jitter, but expressed as an
-            absolute alarm target.
+            absolute alarm target. Re-anchor the ideal grid here and
+            reset the dither remainder so the free-run advance picks up
+            from the corrected phase.
         */
         uint64_t new_target = edge_t + step_us - jit_us[level];
+        cur_target_us = new_target;
+        step_frac = 0;
         hardware_alarm_set_target((uint)alarm_num,                /* PLATFORM */
                                   from_us_since_boot(new_target));
     }
@@ -87,7 +102,6 @@ static void alarm_callback(uint num) {
     (void)num;
     if (!running) return;
 
-    uint64_t sample_t = time_us_64();                             /* PLATFORM */
     bool level_now    = gpio_get(PIN_READ_DATA);                  /* PLATFORM */
 
     /* Idle-break counter: any edge in this period resets it. */
@@ -100,7 +114,9 @@ static void alarm_callback(uint num) {
         return;
     }
 
-    last_sample_us = sample_t;
+    /* The phase reference for the next edge is the ideal time of *this*
+       sample, not the (latency-skewed) moment the ISR happened to run. */
+    last_sample_us = cur_target_us;
 
     /* Pack one sample, MSB-first within each byte. */
     byte_buf = (uint8_t)((byte_buf << 1) | (level_now ? 1u : 0u));
@@ -128,10 +144,15 @@ static void alarm_callback(uint num) {
         return;
     }
 
-    /* Default schedule. The GPIO ISR may override this if an edge
-       lands before this alarm fires. */
+    /* Advance the ideal grid by one step with long-division dither so
+       neither ISR latency nor µs truncation accumulates. The GPIO ISR
+       may override this target if an edge lands before the alarm fires. */
+    uint32_t inc = (uint32_t)(1000000u / step_den);
+    step_frac += 1000000u % step_den;
+    if (step_frac >= step_den) { step_frac -= step_den; inc++; }
+    cur_target_us += inc;
     hardware_alarm_set_target((uint)alarm_num,                    /* PLATFORM */
-                              from_us_since_boot(sample_t + step_us));
+                              from_us_since_boot(cur_target_us));
 }
 
 /* ---- Public API ----------------------------------------------------- */
@@ -152,6 +173,8 @@ bool sampler_start(uint32_t sample_rate,
     if (sample_rate < 1000 || sample_rate > 200000) return false;
 
     step_us     = 1000000ULL / sample_rate;
+    step_den    = sample_rate;
+    step_frac   = 0;
     jit_us[0]   = (uint64_t)(jitter_low  * (double)step_us);
     jit_us[1]   = (uint64_t)(jitter_high * (double)step_us);
     jit_flag[0] = jitter_low  > 0.0;
@@ -171,6 +194,7 @@ bool sampler_start(uint32_t sample_rate,
 
     uint64_t now = time_us_64();                                  /* PLATFORM */
     last_sample_us = now;
+    cur_target_us  = now + step_us;
     running = true;
 
     gpio_set_irq_enabled_with_callback(PIN_READ_DATA,             /* PLATFORM */
@@ -178,7 +202,7 @@ bool sampler_start(uint32_t sample_rate,
         true, gpio_callback);
 
     hardware_alarm_set_target((uint)alarm_num,                    /* PLATFORM */
-                              from_us_since_boot(now + step_us));
+                              from_us_since_boot(cur_target_us));
     return true;
 }
 
