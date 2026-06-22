@@ -28,7 +28,8 @@
 typedef struct {
     uint32_t total_bytes;
     uint32_t total_samples;
-    uint32_t total_edges;
+    uint32_t total_edges;     /* edges accepted (within the sample period) */
+    uint32_t dropped_edges;   /* edges rejected by the ticknow>step guard  */
     int      reason;          /* CZ8RL1_STS_* / CZ8RL1_ERR_* */
     double   jitter_low;      /* avg fall-edge offset / sample period */
     double   jitter_high;     /* avg rise-edge offset / sample period */

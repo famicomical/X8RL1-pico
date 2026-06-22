@@ -133,9 +133,10 @@ static void handle_read(const char *args) {
     /* Drain any tail still in the ring buffer after the ISR stopped. */
     drain_to_usb(&bytes_sent, max_bytes);
 
-    usb_stream_printf("STATS edges=%u bytes=%u samples=%u jl=%.3f jh=%.3f result=%d",
-                      stats.total_edges, stats.total_bytes, stats.total_samples,
-                      stats.jitter_low, stats.jitter_high, stats.reason);
+    usb_stream_printf("STATS edges=%u dropped=%u bytes=%u samples=%u jl=%.3f jh=%.3f result=%d",
+                      stats.total_edges, stats.dropped_edges, stats.total_bytes,
+                      stats.total_samples, stats.jitter_low, stats.jitter_high,
+                      stats.reason);
     usb_stream_write_line("END");
 }
 
